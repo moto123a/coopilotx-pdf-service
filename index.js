@@ -41,6 +41,38 @@ app.post("/generate-pdf", async (req, res) => {
     });
 
     const page = await browser.newPage();
+
+    // ── SSRF protection ──────────────────────────────────────────────
+    // The HTML comes from user resume data, so a crafted <img>/<link>/@import
+    // could make headless Chromium fetch internal resources (cloud metadata
+    // at 169.254.169.254, file://, localhost, private LAN, docker services).
+    // Intercept every sub-resource request and abort anything that isn't a
+    // data: URI or a public http(s) host. Normal resumes only use inline CSS,
+    // data-URI images, and public font/image CDNs, so this never blocks a real
+    // resume while cutting off the SSRF vector entirely.
+    await page.setRequestInterception(true);
+    page.on("request", (reqI) => {
+      const url = reqI.url();
+      if (url.startsWith("data:") || url === "about:blank") return reqI.continue();
+      let parsed;
+      try { parsed = new URL(url); } catch { return reqI.abort(); }
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return reqI.abort();
+      const host = parsed.hostname.toLowerCase();
+      const isPrivate =
+        host === "localhost" ||
+        host === "0.0.0.0" ||
+        host === "[::1]" || host === "::1" ||
+        host.endsWith(".internal") || host.endsWith(".local") ||
+        /^127\./.test(host) ||
+        /^10\./.test(host) ||
+        /^192\.168\./.test(host) ||
+        /^169\.254\./.test(host) ||                       // link-local + cloud metadata
+        /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||        // 172.16.0.0/12
+        /^fe80:/i.test(host) || /^fc/i.test(host) || /^fd/i.test(host); // IPv6 link-local/ULA
+      if (isPrivate) return reqI.abort();
+      return reqI.continue();
+    });
+
     await page.setContent(html, { waitUntil: "networkidle0" });
 
     const format = paperSize === "letter" ? "Letter" : "A4";
