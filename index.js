@@ -1,6 +1,6 @@
 const express = require("express");
 const puppeteer = require("puppeteer");
-const cors = require("cors");
+const crypto = require("crypto");
 const {
   Document, Packer, Paragraph, TextRun, HeadingLevel,
   AlignmentType, BorderStyle, Table, TableRow, TableCell,
@@ -8,11 +8,92 @@ const {
 } = require("docx");
 
 const app = express();
-app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 /* ══════════════════════════════════════════════════════
-   HEALTH CHECK
+   AUTH — this service is internal-only (called by the
+   Spring backend over the Docker network). Every request
+   must carry the shared X-Service-Token; without the env
+   var configured the generate endpoints refuse to run
+   rather than default to open. No CORS: browsers are not
+   a legitimate caller of this service.
+══════════════════════════════════════════════════════ */
+const SERVICE_TOKEN = process.env.PDF_SERVICE_TOKEN || "";
+if (!SERVICE_TOKEN) {
+  console.error("⚠ PDF_SERVICE_TOKEN is not set — generate endpoints will return 503. " +
+                "Set the same token on this service and the backend (openssl rand -hex 32).");
+}
+
+function requireServiceToken(req, res, next) {
+  if (!SERVICE_TOKEN) {
+    return res.status(503).json({ error: "Service not configured" });
+  }
+  const provided = req.get("X-Service-Token") || "";
+  const a = Buffer.from(provided);
+  const b = Buffer.from(SERVICE_TOKEN);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  next();
+}
+
+/* ══════════════════════════════════════════════════════
+   CONCURRENCY CAP — each render costs a Chromium page;
+   without a cap a request burst exhausts the host.
+══════════════════════════════════════════════════════ */
+const MAX_CONCURRENT_RENDERS = 3;
+let activeRenders = 0;
+
+/* ══════════════════════════════════════════════════════
+   SHARED BROWSER — one Chromium for the process lifetime
+   (a fresh page per request) instead of a full launch per
+   request. Relaunches automatically if it crashes.
+   --no-sandbox is required because the container runs as
+   root; SSRF is instead blocked per-request below.
+══════════════════════════════════════════════════════ */
+let browserPromise = null;
+
+async function getBrowser() {
+  if (browserPromise) {
+    try {
+      const b = await browserPromise;
+      if (b.connected) return b;
+    } catch { /* fall through to relaunch */ }
+  }
+  browserPromise = puppeteer.launch({
+    headless: true,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+    ],
+  });
+  return browserPromise;
+}
+
+// Only these external hosts may be fetched while rendering (webfonts).
+// Everything else — cloud metadata endpoints, localhost, internal Docker
+// hostnames, arbitrary internet URLs — is aborted, which closes the SSRF
+// hole where attacker HTML exfiltrates internal responses into the PDF.
+const ALLOWED_REMOTE_HOSTS = new Set([
+  "fonts.googleapis.com",
+  "fonts.gstatic.com",
+]);
+
+function isRequestAllowed(url) {
+  if (url.startsWith("data:") || url === "about:blank") return true;
+  try {
+    const parsed = new URL(url);
+    return (parsed.protocol === "https:" || parsed.protocol === "http:")
+        && ALLOWED_REMOTE_HOSTS.has(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+/* ══════════════════════════════════════════════════════
+   HEALTH CHECK (unauthenticated — used by Docker/monitor)
 ══════════════════════════════════════════════════════ */
 app.get("/health", (req, res) => {
   res.json({ status: "ok" });
@@ -21,59 +102,32 @@ app.get("/health", (req, res) => {
 /* ══════════════════════════════════════════════════════
    PDF GENERATION
 ══════════════════════════════════════════════════════ */
-app.post("/generate-pdf", async (req, res) => {
+app.post("/generate-pdf", requireServiceToken, async (req, res) => {
   const { html, paperSize } = req.body;
 
-  if (!html) {
-    return res.status(400).json({ error: "html is required" });
+  if (!html || !html.trim()) {
+    return res.status(400).json({ error: "html is required and cannot be empty" });
   }
 
-  let browser;
+  if (activeRenders >= MAX_CONCURRENT_RENDERS) {
+    return res.status(429).json({ error: "Renderer busy, retry shortly" });
+  }
+  activeRenders++;
+
+  let page;
   try {
-    browser = await puppeteer.launch({
-      headless: "new",
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-      ],
-    });
+    const browser = await getBrowser();
+    page = await browser.newPage();
 
-    const page = await browser.newPage();
-
-    // ── SSRF protection ──────────────────────────────────────────────
-    // The HTML comes from user resume data, so a crafted <img>/<link>/@import
-    // could make headless Chromium fetch internal resources (cloud metadata
-    // at 169.254.169.254, file://, localhost, private LAN, docker services).
-    // Intercept every sub-resource request and abort anything that isn't a
-    // data: URI or a public http(s) host. Normal resumes only use inline CSS,
-    // data-URI images, and public font/image CDNs, so this never blocks a real
-    // resume while cutting off the SSRF vector entirely.
+    // Block all network access from the rendered document except data: URIs
+    // and the webfont allowlist (see isRequestAllowed).
     await page.setRequestInterception(true);
-    page.on("request", (reqI) => {
-      const url = reqI.url();
-      if (url.startsWith("data:") || url === "about:blank") return reqI.continue();
-      let parsed;
-      try { parsed = new URL(url); } catch { return reqI.abort(); }
-      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return reqI.abort();
-      const host = parsed.hostname.toLowerCase();
-      const isPrivate =
-        host === "localhost" ||
-        host === "0.0.0.0" ||
-        host === "[::1]" || host === "::1" ||
-        host.endsWith(".internal") || host.endsWith(".local") ||
-        /^127\./.test(host) ||
-        /^10\./.test(host) ||
-        /^192\.168\./.test(host) ||
-        /^169\.254\./.test(host) ||                       // link-local + cloud metadata
-        /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||        // 172.16.0.0/12
-        /^fe80:/i.test(host) || /^fc/i.test(host) || /^fd/i.test(host); // IPv6 link-local/ULA
-      if (isPrivate) return reqI.abort();
-      return reqI.continue();
+    page.on("request", (request) => {
+      if (isRequestAllowed(request.url())) request.continue();
+      else request.abort();
     });
 
-    await page.setContent(html, { waitUntil: "networkidle0" });
+    await page.setContent(html, { waitUntil: "networkidle0", timeout: 30000 });
 
     const format = paperSize === "letter" ? "Letter" : "A4";
 
@@ -84,8 +138,6 @@ app.post("/generate-pdf", async (req, res) => {
       displayHeaderFooter: false, // ← NO browser headers/footers
     });
 
-    await browser.close();
-
     res.set({
       "Content-Type": "application/pdf",
       "Content-Disposition": "attachment; filename=resume.pdf",
@@ -94,16 +146,18 @@ app.post("/generate-pdf", async (req, res) => {
     res.send(pdf);
 
   } catch (err) {
-    if (browser) await browser.close();
     console.error("PDF generation error:", err);
     res.status(500).json({ error: "PDF generation failed: " + err.message });
+  } finally {
+    if (page) { try { await page.close(); } catch {} }
+    activeRenders--;
   }
 });
 
 /* ══════════════════════════════════════════════════════
    WORD GENERATION
 ══════════════════════════════════════════════════════ */
-app.post("/generate-word", async (req, res) => {
+app.post("/generate-word", requireServiceToken, async (req, res) => {
   const { data, styles } = req.body;
 
   if (!data) {
@@ -117,11 +171,15 @@ app.post("/generate-word", async (req, res) => {
 
     const hexToRgb = (hex) => {
       const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
-      return result ? {
+      if (!result) {
+        console.warn(`hexToRgb: invalid hex color "${hex}", falling back to default`);
+        return { r: 45, g: 91, b: 227 };
+      }
+      return {
         r: parseInt(result[1], 16),
         g: parseInt(result[2], 16),
         b: parseInt(result[3], 16),
-      } : { r: 45, g: 91, b: 227 };
+      };
     };
 
     const acRgb = hexToRgb(ac);
@@ -301,7 +359,7 @@ app.post("/generate-word", async (req, res) => {
 
     const buffer = await Packer.toBuffer(doc);
 
-    const name = pi.name ? pi.name.replace(/\s+/g, "_") : "Resume";
+    const name = pi.name ? pi.name.replace(/\s+/g, "_") : `Resume_${Date.now()}`;
     res.set({
       "Content-Type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       "Content-Disposition": `attachment; filename=${name}_Resume.docx`,
