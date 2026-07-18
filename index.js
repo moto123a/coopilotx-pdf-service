@@ -131,12 +131,14 @@ app.post("/generate-pdf", requireServiceToken, async (req, res) => {
 
     const format = paperSize === "letter" ? "Letter" : "A4";
 
-    const pdf = await page.pdf({
+    // puppeteer ≥22 returns a Uint8Array; Express JSON-serializes those, so
+    // wrap in a Buffer to send real binary.
+    const pdf = Buffer.from(await page.pdf({
       format,
       printBackground: true,
       margin: { top: 0, right: 0, bottom: 0, left: 0 },
       displayHeaderFooter: false, // ← NO browser headers/footers
-    });
+    }));
 
     res.set({
       "Content-Type": "application/pdf",
